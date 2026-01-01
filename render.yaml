@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegram-drama-bot
+    env: python
+    runtime: python-3.11
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_CHANNEL
+        sync: false
+      - key: PORT
+        value: 10000
+    autoDeploy: true
