@@ -1,1465 +1,528 @@
-import os
-import logging
-import secrets
-import string
-from datetime import datetime, timedelta
-from threading import Thread
-from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.error import BadRequest
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes
-)
-
-# =====================================
-# LOGGING
-# =====================================
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-logging.getLogger('httpx').setLevel(logging.WARNING)
-logging.getLogger('telegram').setLevel(logging.WARNING)
-
-# =====================================
-# ENVIRONMENT
-# =====================================
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
-ADMIN_IDS = os.environ.get('ADMIN_IDS', '').strip()
-DATABASE_CHANNEL = os.environ.get('DATABASE_CHANNEL', '').strip()
-PORT = int(os.environ.get('PORT', 10000))
-
-# Logo Bot - Direct Link
-BOT_LOGO = "https://i.imgur.com/N5aeIKD.png"
-
-# Harga Langganan (dalam RM - Ringgit Malaysia)
-SUBSCRIPTION_PRICES = {
-    "7_hari": {"name": "7 Hari", "days": 7, "price": 5},
-    "30_hari": {"name": "30 Hari", "days": 30, "price": 12},
-    "60_hari": {"name": "60 Hari", "days": 60, "price": 30},
-}
-
-# Episode yang dikunci (dari episode 5 ke atas)
-LOCKED_EPISODE_START = 5
-
-# Peringatan sebelum expired (dalam hari)
-WARNING_DAYS_BEFORE_EXPIRE = 3
-
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN tidak boleh kosong!")
-
-# ADMIN
-ADMIN_USER_IDS = set()
-if ADMIN_IDS:
-    for uid in ADMIN_IDS.split(','):
-        try:
-            ADMIN_USER_IDS.add(int(uid.strip()))
-        except:
-            pass
-
-def is_admin(user_id: int) -> bool:
-    if ADMIN_USER_IDS:
-        return user_id in ADMIN_USER_IDS
-    return False
-
-# CHANNEL DB
-DATABASE_CHANNEL_ID = None
-if DATABASE_CHANNEL:
-    try:
-        clean = DATABASE_CHANNEL.replace(" ", '').replace('"', '').replace("'", '')
-        DATABASE_CHANNEL_ID = int(clean)
-    except:
-        logger.warning("DATABASE_CHANNEL format salah")
-
-# =====================================
-# MEMORY DATABASE
-# =====================================
-drama_database = {}
-
-# Database Langganan User: {user_id: {"expires": datetime, "type": "7_hari"}}
-user_subscriptions = {}
-
-# Database Token: {token: {"type": "7_hari", "used": False, "created_by": admin_id, "created_at": datetime}}
-subscription_tokens = {}
-
-# Track video message untuk dihapus: {user_id: {"video": message_id, "nav": message_id}}
-user_video_messages = {}
-
-# Track users yang sudah dismiss warning: {user_id: True}
-dismissed_warnings = {}
-
-# Track drama aktif untuk upload episode: {admin_id: {"drama_id": "xxx", "title": "xxx"}}
-active_upload_drama = {}
-
-# =====================================
-# FLASK SERVER
-# =====================================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return {
-        'status': 'online',
-        'dramas': len(drama_database),
-        'subscribers': len([u for u, s in user_subscriptions.items() if s.get('expires', datetime.min) > datetime.now()])
-    }
-
-def run_flask():
-    app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
-
-
-# =====================================
-# SUBSCRIPTION HELPERS
-# =====================================
-def generate_token(length=12):
-    """Generate random token"""
-    chars = string.ascii_uppercase + string.digits
-    return 'VVIP-' + ''.join(secrets.choice(chars) for _ in range(length))
-
-def is_user_subscribed(user_id: int) -> bool:
-    """Check if user has active subscription"""
-    if user_id in user_subscriptions:
-        expires = user_subscriptions[user_id].get('expires')
-        if expires and expires > datetime.now():
-            return True
-    return False
-
-def get_subscription_info(user_id: int) -> dict:
-    """Get user subscription info"""
-    if user_id in user_subscriptions:
-        return user_subscriptions[user_id]
-    return None
-
-def is_expiring_soon(user_id: int) -> tuple:
-    """Check if subscription is expiring within WARNING_DAYS_BEFORE_EXPIRE days"""
-    if user_id in user_subscriptions:
-        expires = user_subscriptions[user_id].get('expires')
-        if expires and expires > datetime.now():
-            remaining = expires - datetime.now()
-            if remaining.days <= WARNING_DAYS_BEFORE_EXPIRE:
-                return True, remaining.days, remaining.seconds // 3600
-    return False, 0, 0
-
-def is_episode_locked(ep_number) -> bool:
-    """Check if episode is locked (episode 5+)"""
-    try:
-        ep_num = int(ep_number)
-        return ep_num >= LOCKED_EPISODE_START
-    except:
-        return False
-
-def activate_subscription(user_id: int, sub_type: str) -> bool:
-    """Activate subscription for user"""
-    if sub_type not in SUBSCRIPTION_PRICES:
-        return False
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DramaBox - Download Drama Full Episode</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { font-family: 'Inter', sans-serif; }
+        .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
     
-    days = SUBSCRIPTION_PRICES[sub_type]["days"]
-    
-    # If user already has subscription, extend it
-    if user_id in user_subscriptions and user_subscriptions[user_id].get('expires', datetime.min) > datetime.now():
-        current_expires = user_subscriptions[user_id]['expires']
-        new_expires = current_expires + timedelta(days=days)
-    else:
-        new_expires = datetime.now() + timedelta(days=days)
-    
-    user_subscriptions[user_id] = {
-        'expires': new_expires,
-        'type': sub_type,
-        'activated_at': datetime.now()
-    }
-    
-    # Reset dismissed warning when subscription is renewed
-    if user_id in dismissed_warnings:
-        del dismissed_warnings[user_id]
-    
-    return True
+    <!-- Header -->
+    <header class="sticky top-0 z-50 bg-gray-800 border-b border-gray-700">
+        <div class="max-w-6xl mx-auto px-4 py-3">
+            <div class="flex items-center gap-4">
+                <h1 onclick="goHome()" class="text-xl font-bold text-purple-400 cursor-pointer flex items-center gap-2">
+                    <svg class="w-6 h-6" fill="currentColor" viewBox="0 0 24 24"><path d="M4 8H2v12c0 1.1.9 2 2 2h12v-2H4V8zm16-6H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8 12.5v-9l6 4.5-6 4.5z"/></svg>
+                    DramaBox
+                </h1>
+                <div class="flex-1 max-w-md relative">
+                    <input type="text" id="searchInput" placeholder="Cari drama..." 
+                        class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-sm focus:outline-none focus:border-purple-500"
+                        oninput="handleSearch(this.value)" onkeypress="if(event.key==='Enter') doSearch()">
+                    <div id="suggestions" class="hidden absolute top-full left-0 right-0 mt-1 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-50 max-h-60 overflow-y-auto"></div>
+                </div>
+            </div>
+        </div>
+    </header>
 
+    <!-- Main Content -->
+    <main id="app" class="max-w-6xl mx-auto px-4 py-6"></main>
 
-# =====================================
-# HELPERS: SAFE EDIT / REPLY
-# =====================================
-async def safe_edit_or_reply(query, text, reply_markup=None, parse_mode=None):
-    try:
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        return
-    except BadRequest as e:
-        logger.debug(f"edit_message_text failed: {e}; will fallback to reply_text")
-    except Exception as e:
-        logger.debug(f"edit_message_text exception: {e}; fallback to reply_text")
+    <!-- Download Modal -->
+    <div id="downloadModal" class="fixed inset-0 z-[100] hidden">
+        <div class="absolute inset-0 bg-black/80" onclick="closeDownloadModal()"></div>
+        <div class="relative h-full flex items-center justify-center p-4">
+            <div class="bg-gray-800 rounded-xl w-full max-w-lg overflow-hidden shadow-2xl">
+                <div class="p-4 border-b border-gray-700 flex justify-between items-center">
+                    <h3 class="font-bold text-lg">Download ZIP</h3>
+                    <button onclick="closeDownloadModal()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+                </div>
+                <div class="p-4">
+                    <div id="dlDramaInfo" class="flex items-center gap-3 mb-4 p-3 bg-gray-700 rounded-lg">
+                        <img id="dlCover" src="" class="w-12 h-16 object-cover rounded">
+                        <div>
+                            <h4 id="dlTitle" class="font-bold"></h4>
+                            <p id="dlEpCount" class="text-sm text-gray-400"></p>
+                        </div>
+                    </div>
+                    
+                    <div class="mb-4">
+                        <div class="flex justify-between text-sm mb-1">
+                            <span id="dlStatus">Mempersiapkan...</span>
+                            <span id="dlProgress">0%</span>
+                        </div>
+                        <div class="h-3 bg-gray-700 rounded-full overflow-hidden">
+                            <div id="dlBar" class="h-full bg-gradient-to-r from-purple-500 to-pink-500 transition-all duration-300" style="width:0%"></div>
+                        </div>
+                        <p id="dlDetail" class="text-xs text-gray-500 mt-2 text-center"></p>
+                    </div>
+                    
+                    <div id="dlLog" class="max-h-40 overflow-y-auto text-xs space-y-1 mb-4 bg-gray-900 rounded-lg p-3"></div>
+                    
+                    <div class="flex gap-2">
+                        <button onclick="closeDownloadModal()" id="btnClose" class="hidden flex-1 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg font-medium">Tutup</button>
+                        <button onclick="cancelDownload()" id="btnCancel" class="flex-1 py-2 bg-red-600 hover:bg-red-700 rounded-lg font-medium">Batalkan</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-    try:
-        await query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except Exception as e:
-        logger.error(f"Failed to reply with fallback message: {e}")
+    <!-- Video Modal -->
+    <div id="videoModal" class="fixed inset-0 z-[100] hidden">
+        <div class="absolute inset-0 bg-black/90" onclick="closeVideo()"></div>
+        <div class="relative h-full flex items-center justify-center p-4">
+            <div class="bg-gray-800 rounded-xl w-full max-w-4xl overflow-hidden shadow-2xl">
+                <div class="p-3 border-b border-gray-700 flex justify-between items-center">
+                    <h3 id="videoTitle" class="font-bold truncate"></h3>
+                    <button onclick="closeVideo()" class="text-gray-400 hover:text-white text-2xl">&times;</button>
+                </div>
+                <div class="flex flex-col lg:flex-row">
+                    <div class="flex-1 bg-black">
+                        <video id="videoPlayer" class="w-full aspect-video" controls></video>
+                    </div>
+                    <div class="lg:w-64 p-3 border-t lg:border-t-0 lg:border-l border-gray-700 max-h-80 lg:max-h-[60vh] overflow-y-auto">
+                        <p class="text-sm text-gray-400 mb-2">Episode:</p>
+                        <div id="epList" class="grid grid-cols-6 lg:grid-cols-4 gap-1"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
 
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
-
-
-# =====================================
-# START MENU
-# =====================================
-def build_start_keyboard(is_admin_user: bool, user_id: int):
-    is_subscribed = is_user_subscribed(user_id)
-    
-    keyboard = [
-        [InlineKeyboardButton("🔍 Cari Drama", callback_data='search')],
-        [InlineKeyboardButton("📺 Daftar Drama", callback_data='list')],
-    ]
-    
-    if is_subscribed:
-        keyboard.append([InlineKeyboardButton("👑 Cek Langganan VVIP", callback_data='check_sub')])
-    else:
-        keyboard.append([InlineKeyboardButton("👑 Berlangganan VVIP", callback_data='subscribe')])
-    
-    keyboard.append([InlineKeyboardButton("🎟️ Redeem Token", callback_data='redeem')])
-    keyboard.append([InlineKeyboardButton("📞 Hubungi Admin", url="https://t.me/admin")])
-    
-    if is_admin_user:
-        keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data='admin_panel')])
-    
-    return InlineKeyboardMarkup(keyboard)
-
-def build_expiry_warning_keyboard():
-    """Build keyboard for expiry warning"""
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Perpanjang Sekarang", callback_data='subscribe')],
-        [InlineKeyboardButton("❌ Nanti Saja", callback_data='dismiss_warning')]
-    ])
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.from_user.id
-    is_subscribed = is_user_subscribed(user_id)
-    kb = build_start_keyboard(is_admin(user_id), user_id)
-    
-    vip_status = "👑 VVIP Member" if is_subscribed else "👤 Free Member"
-    
-    welcome_text = (
-        "🎬 *DRAMACHIN by D3D1*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "Selamat datang di nonton streaming drama China dan drama lainnya terlengkap!\n\n"
-        f"📊 *Total Drama:* {len(drama_database)}\n"
-        f"🎥 *Total Episode:* {sum(len(d.get('episodes', {})) for d in drama_database.values())}\n\n"
-        f"🔐 *Status:* {vip_status}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "⚠️ *Info:* Episode 5 ke atas membutuhkan langganan VVIP\n\n"
-        "Pilih menu di bawah untuk mulai:"
-    )
-    
-    # Check if user has expiring subscription and hasn't dismissed warning
-    expiring, days_left, hours_left = is_expiring_soon(user_id)
-    
-    # Send logo with welcome text as caption (combined in one message)
-    if BOT_LOGO:
-        try:
-            await update.message.reply_photo(
-                photo=BOT_LOGO,
-                caption=welcome_text,
-                reply_markup=kb,
-                parse_mode='Markdown'
-            )
-            logger.info("Logo with welcome message sent successfully")
-        except Exception as e:
-            logger.error(f"Failed to send logo: {e}")
-            # Fallback to text only if logo fails
-            await update.message.reply_text(
-                welcome_text,
-                reply_markup=kb,
-                parse_mode='Markdown'
-            )
-    else:
-        # No logo, send text only
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=kb,
-            parse_mode='Markdown'
-        )
-    
-    # Send expiry warning if applicable and not dismissed
-    if expiring and user_id not in dismissed_warnings:
-        if days_left > 0:
-            time_text = f"{days_left} hari {hours_left} jam"
-        else:
-            time_text = f"{hours_left} jam"
+    <script>
+        const API = 'https://restxdb.onrender.com/api';
+        const LANG = 'in';
         
-        warning_text = (
-            "⚠️ *PERINGATAN LANGGANAN*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"Langganan VVIP kamu akan berakhir dalam *{time_text}* lagi!\n\n"
-            "Perpanjang sekarang untuk tetap menikmati akses penuh ke semua episode.\n"
-            "━━━━━━━━━━━━━━━━━━━━"
-        )
-        
-        await update.message.reply_text(
-            warning_text,
-            reply_markup=build_expiry_warning_keyboard(),
-            parse_mode='Markdown'
-        )
+        let state = {
+            drama: null,
+            dramaId: null,
+            episodes: [],
+            currentEp: 0,
+            hls: null,
+            cancelled: false,
+            downloading: false
+        };
 
+        const $ = id => document.getElementById(id);
 
-# =====================================
-# INDEX FORWARD SYSTEM
-# =====================================
-async def index_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    user_id = msg.from_user.id
-
-    if not is_admin(user_id):
-        await msg.reply_text("❌ Hanya admin yang boleh index.")
-        return
-
-    origin = msg.forward_origin
-
-    if not origin:
-        await msg.reply_text("❌ Ini bukan pesan forward channel.")
-        return
-
-    origin_chat = getattr(origin, 'chat', None)
-    
-    if DATABASE_CHANNEL_ID and origin_chat and origin_chat.id != DATABASE_CHANNEL_ID:
-        await msg.reply_text("❌ Pesan bukan dari database channel.")
-        return
-
-    result = await parse_and_index_message(msg, context, user_id)
-
-    if result == "NO_ACTIVE_DRAMA":
-        await msg.reply_text(
-            "❌ *Tidak Ada Drama Aktif*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Untuk upload episode, kirim thumbnail dulu dengan format:\n\n"
-            "📸 `#ID JudulDrama`\n\n"
-            "Contoh:\n"
-            "`#LBFD Love Between Fairy and Devil`\n\n"
-            "Setelah itu baru kirim video episode (tanpa caption).",
-            parse_mode='Markdown'
-        )
-    elif result:
-        await msg.reply_text(result, parse_mode='Markdown')
-    else:
-        await msg.reply_text(
-            "❌ *Format Salah*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "*Cara Upload:*\n\n"
-            "1️⃣ Kirim *Thumbnail* dengan caption:\n"
-            "   `#ID JudulDrama`\n\n"
-            "2️⃣ Kirim *Video Episode* tanpa caption\n"
-            "   (Episode akan otomatis dinomori)\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "*Contoh:*\n"
-            "• Thumbnail: `#LBFD Love Between Fairy and Devil`\n"
-            "• Video: _(langsung kirim tanpa caption)_",
-            parse_mode='Markdown'
-        )
-
-
-async def parse_and_index_message(message, context, user_id):
-    global drama_database, active_upload_drama
-
-    try:
-        caption = message.caption or ""
-
-        # VIDEO (EPISODE) - Tanpa caption, ambil dari drama aktif
-        if message.video:
-            # Cek apakah ada drama aktif untuk admin ini
-            if user_id not in active_upload_drama:
-                return "NO_ACTIVE_DRAMA"
-            
-            active = active_upload_drama[user_id]
-            drama_id = active["drama_id"]
-            title = active["title"]
-            
-            # Hitung episode berikutnya
-            if drama_id in drama_database:
-                existing_eps = drama_database[drama_id].get("episodes", {})
-                # Cari episode tertinggi
-                max_ep = 0
-                for ep_key in existing_eps.keys():
-                    try:
-                        ep_num = int(ep_key)
-                        if ep_num > max_ep:
-                            max_ep = ep_num
-                    except:
-                        pass
-                next_ep = str(max_ep + 1)
-            else:
-                drama_database[drama_id] = {"title": title, "episodes": {}}
-                next_ep = "1"
-            
-            ep = next_ep
-            
-            is_update = ep in drama_database[drama_id].get("episodes", {})
-            
-            drama_database[drama_id]["episodes"][ep] = {
-                "file_id": message.video.file_id
+        // ========== API ==========
+        async function api(endpoint) {
+            try {
+                const res = await fetch(`${API}${endpoint}`);
+                return await res.json();
+            } catch(e) {
+                console.error('API Error:', e);
+                return null;
             }
-
-            video = message.video
-            duration = f"{video.duration // 60}:{video.duration % 60:02d}" if video.duration else "N/A"
-            file_size = f"{video.file_size / (1024*1024):.2f} MB" if video.file_size else "N/A"
-            
-            total_eps = len(drama_database[drama_id]["episodes"])
-            is_locked = is_episode_locked(ep)
-            
-            logger.info(f"Indexed: {drama_id} - {title} EP {ep}")
-            
-            response = (
-                f"✅ *Berhasil Diindex!*\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📹 *Tipe:* Episode Video\n"
-                f"🎬 *Drama:* {title}\n"
-                f"🆔 *ID:* #{drama_id}\n"
-                f"📺 *Episode:* {ep}\n"
-                f"⏱ *Durasi:* {duration}\n"
-                f"💾 *Ukuran:* {file_size}\n"
-                f"🔐 *Status:* {'🔒 Terkunci (VVIP)' if is_locked else '🔓 Gratis'}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 Total episode sekarang: *{total_eps} EP*\n\n"
-                f"_Kirim video lagi untuk Episode {int(ep)+1}_"
-            )
-            
-            return response
-
-        # PHOTO (THUMBNAIL) - Dengan caption format: #ID JudulDrama
-        if message.photo:
-            if not caption.startswith("#"):
-                return False
-
-            parts = caption.split(" ", 1)
-            drama_id = parts[0][1:]
-            title = parts[1].strip() if len(parts) > 1 else "Unknown"
-
-            is_new_drama = drama_id not in drama_database
-            has_old_thumbnail = not is_new_drama and "thumbnail" in drama_database[drama_id]
-            
-            if is_new_drama:
-                drama_database[drama_id] = {"title": title, "episodes": {}}
-
-            drama_database[drama_id]["thumbnail"] = message.photo[-1].file_id
-            drama_database[drama_id]["title"] = title
-            
-            # Set drama aktif untuk upload episode selanjutnya
-            active_upload_drama[user_id] = {
-                "drama_id": drama_id,
-                "title": title
-            }
-
-            photo = message.photo[-1]
-            resolution = f"{photo.width}x{photo.height}"
-            file_size = f"{photo.file_size / 1024:.2f} KB" if photo.file_size else "N/A"
-            
-            total_eps = len(drama_database[drama_id].get("episodes", {}))
-            
-            logger.info(f"Indexed thumbnail: {drama_id} - {title}")
-            
-            response = (
-                f"✅ *Berhasil Diindex!*\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🖼 *Tipe:* Thumbnail Drama\n"
-                f"🎬 *Drama:* {title}\n"
-                f"🆔 *ID:* #{drama_id}\n"
-                f"📐 *Resolusi:* {resolution}\n"
-                f"💾 *Ukuran:* {file_size}\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-            )
-            
-            if is_new_drama:
-                response += f"🆕 Drama baru dibuat!\n"
-            elif has_old_thumbnail:
-                response += f"🔄 Thumbnail diperbarui!\n"
-            else:
-                response += f"➕ Thumbnail ditambahkan!\n"
-                
-            response += f"📊 Total episode: *{total_eps} EP*\n\n"
-            response += f"🎬 *Drama Aktif:* {title}\n"
-            response += f"_Sekarang kirim video episode (tanpa caption)_"
-            
-            return response
-
-        return False
-
-    except Exception as e:
-        logger.error(f"parse_and_index_message error: {e}")
-        return False
-
-
-# =====================================
-# PAGINATION HELPER
-# =====================================
-def paginate_items(items, page, items_per_page=10):
-    start = page * items_per_page
-    end = start + items_per_page
-    return items[start:end], len(items)
-
-
-# =====================================
-# CALLBACK BUTTONS
-# =====================================
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user_id = query.from_user.id
-    await query.answer()
-
-    # ============================
-    # NOOP (do nothing)
-    # ============================
-    if query.data == "noop":
-        return
-
-    # ============================
-    # DISMISS WARNING
-    # ============================
-    if query.data == "dismiss_warning":
-        dismissed_warnings[user_id] = True
-        try:
-            await query.message.delete()
-        except:
-            pass
-        return
-
-    # ============================
-    # MENU UTAMA (BACK)
-    # ============================
-    if query.data == "back":
-        kb = build_start_keyboard(is_admin(user_id), user_id)
-        is_subscribed = is_user_subscribed(user_id)
-        vip_status = "👑 VVIP Member" if is_subscribed else "👤 Free Member"
-        
-        welcome_text = (
-            "🎬 *DRAMACHIN by D3D1*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊 Total Drama: {len(drama_database)}\n"
-            f"🎥 Total Episode: {sum(len(d.get('episodes', {})) for d in drama_database.values())}\n"
-            f"🔐 Status: {vip_status}\n\n"
-            "Pilih menu:"
-        )
-        
-        # Delete current message first
-        try:
-            await query.message.delete()
-        except:
-            pass
-        
-        # Send logo with welcome text as caption (combined)
-        if BOT_LOGO:
-            try:
-                await context.bot.send_photo(
-                    chat_id=query.message.chat_id,
-                    photo=BOT_LOGO,
-                    caption=welcome_text,
-                    reply_markup=kb,
-                    parse_mode='Markdown'
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send logo on back: {e}")
-                # Fallback to text only
-                await context.bot.send_message(
-                    chat_id=query.message.chat_id,
-                    text=welcome_text,
-                    reply_markup=kb,
-                    parse_mode='Markdown'
-                )
-        else:
-            # No logo, send text only
-            await context.bot.send_message(
-                chat_id=query.message.chat_id,
-                text=welcome_text,
-                reply_markup=kb,
-                parse_mode='Markdown'
-            )
-        return
-
-    # ============================
-    # SUBSCRIBE INFO
-    # ============================
-    if query.data == "subscribe":
-        price_list = ""
-        for key, info in SUBSCRIPTION_PRICES.items():
-            price_list += f"• *{info['name']}*: RM{info['price']}\n"
-        
-        subscribe_text = (
-            "👑 *BERLANGGANAN VVIP*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Dengan berlangganan VVIP, kamu bisa:\n"
-            "✅ Akses semua film drama yang ada\n"
-            "✅ Akses semua episode drama\n"
-            "✅ Tonton episode 5 sampai selesai\n"
-            "✅ Tanpa batasan\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "💰 *DAFTAR HARGA:*\n\n"
-            f"{price_list}\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📝 *CARA BERLANGGANAN:*\n\n"
-            "1️⃣ Hubungi admin untuk berlangganan\n"
-            "2️⃣ Pilih paket langganan\n"
-            "3️⃣ Transfer sesuai harga paket\n"
-            "4️⃣ Kirim bukti transfer ke admin\n"
-            "5️⃣ Admin akan kirim token\n"
-            "6️⃣ Redeem token di menu utama\n\n"
-            "⚠️ *Token hanya bisa digunakan 1x!*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "📞 *Hubungi admin untuk info pembayaran dan berlangganan*"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("📞 Hubungi Admin", url="https://t.me/admin")],
-            [InlineKeyboardButton("« Kembali", callback_data="back")]
-        ]
-        
-        await safe_edit_or_reply(query, subscribe_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    # ============================
-    # CHECK SUBSCRIPTION
-    # ============================
-    if query.data == "check_sub":
-        sub_info = get_subscription_info(user_id)
-        
-        if sub_info and sub_info.get('expires', datetime.min) > datetime.now():
-            expires = sub_info['expires']
-            remaining = expires - datetime.now()
-            days_left = remaining.days
-            hours_left = remaining.seconds // 3600
-            
-            sub_type = SUBSCRIPTION_PRICES.get(sub_info.get('type', ''), {}).get('name', 'Unknown')
-            
-            # Check if expiring soon
-            is_expiring = days_left <= WARNING_DAYS_BEFORE_EXPIRE
-            
-            check_text = (
-                "👑 *STATUS LANGGANAN VVIP*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "✅ *Status:* AKTIF\n\n"
-                f"📦 *Paket:* {sub_type}\n"
-                f"📅 *Berakhir:* {expires.strftime('%d %B %Y, %H:%M')}\n"
-                f"⏳ *Sisa Waktu:* {days_left} hari {hours_left} jam\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-            )
-            
-            if is_expiring:
-                check_text += "⚠️ *Langganan kamu akan segera berakhir!*\nPerpanjang sekarang untuk akses tanpa gangguan."
-            else:
-                check_text += "Nikmati akses penuh ke semua episode! 🎬"
-            
-            keyboard = []
-            if is_expiring:
-                keyboard.append([InlineKeyboardButton("✅ Perpanjang Sekarang", callback_data="subscribe")])
-            keyboard.append([InlineKeyboardButton("« Kembali", callback_data="back")])
-            
-        else:
-            check_text = (
-                "👑 *STATUS LANGGANAN VVIP*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "❌ *Status:* TIDAK AKTIF\n\n"
-                "Kamu belum memiliki langganan aktif.\n"
-                "Berlangganan sekarang untuk akses penuh!"
-            )
-            
-            keyboard = [
-                [InlineKeyboardButton("👑 Berlangganan", callback_data="subscribe")],
-                [InlineKeyboardButton("« Kembali", callback_data="back")]
-            ]
-        
-        await safe_edit_or_reply(query, check_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    # ============================
-    # REDEEM TOKEN
-    # ============================
-    if query.data == "redeem":
-        redeem_text = (
-            "🎟️ *REDEEM TOKEN VVIP*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Masukkan token langganan yang kamu terima dari admin.\n\n"
-            "Format token: `VVIP-XXXXXXXXXXXX`\n\n"
-            "Ketik token kamu sekarang:"
-        )
-        
-        keyboard = [[InlineKeyboardButton("« Kembali", callback_data="back")]]
-        await safe_edit_or_reply(query, redeem_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        context.user_data["waiting"] = "redeem_token"
-        return
-
-    # ============================
-    # SEARCH
-    # ============================
-    if query.data == "search":
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="back")]])
-        search_text = (
-            "🔍 *Pencarian Drama*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Ketik nama drama yang ingin kamu cari:\n\n"
-            "Contoh: _Love Between Fairy_"
-        )
-        await safe_edit_or_reply(query, search_text, reply_markup=kb, parse_mode='Markdown')
-        context.user_data["waiting"] = "search"
-        return
-
-    # ============================
-    # ADMIN PANEL
-    # ============================
-    if query.data == "admin_panel":
-        if not is_admin(user_id):
-            await safe_edit_or_reply(query, "❌ Hanya admin yang bisa mengakses panel ini.")
-            return
-        
-        active_subs = len([u for u, s in user_subscriptions.items() if s.get('expires', datetime.min) > datetime.now()])
-        unused_tokens = len([t for t, info in subscription_tokens.items() if not info.get('used', False)])
-        
-        admin_text = (
-            "⚙️ *Admin Panel*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Total Drama: {len(drama_database)}\n"
-            f"🎥 Total Episode: {sum(len(d.get('episodes', {})) for d in drama_database.values())}\n"
-            f"👑 Subscriber Aktif: {active_subs}\n"
-            f"🎟️ Token Tersedia: {unused_tokens}\n\n"
-            "Pilih aksi:"
-        )
-        keyboard = [
-            [InlineKeyboardButton("➕ Upload Drama", callback_data='upload')],
-            [InlineKeyboardButton("🎟️ Generate Token", callback_data='gen_token')],
-            [InlineKeyboardButton("📋 Lihat Token", callback_data='list_tokens')],
-            [InlineKeyboardButton("👥 Lihat Subscriber", callback_data='list_subs')],
-            [InlineKeyboardButton("📊 Statistik", callback_data='stats')],
-            [InlineKeyboardButton("« Kembali", callback_data="back")]
-        ]
-        await safe_edit_or_reply(query, admin_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    # ============================
-    # GENERATE TOKEN (ADMIN)
-    # ============================
-    if query.data == "gen_token":
-        if not is_admin(user_id):
-            await safe_edit_or_reply(query, "❌ Hanya admin")
-            return
-        
-        gen_text = (
-            "🎟️ *Generate Token Langganan*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Pilih durasi langganan untuk token:"
-        )
-        
-        keyboard = []
-        for key, info in SUBSCRIPTION_PRICES.items():
-            keyboard.append([InlineKeyboardButton(
-                f"📦 {info['name']} - RM{info['price']}", 
-                callback_data=f"create_token_{key}"
-            )])
-        keyboard.append([InlineKeyboardButton("« Admin Panel", callback_data="admin_panel")])
-        
-        await safe_edit_or_reply(query, gen_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    # ============================
-    # RESET ACTIVE DRAMA (ADMIN)
-    # ============================
-    if query.data == "reset_active_drama":
-        if not is_admin(user_id):
-            await safe_edit_or_reply(query, "❌ Hanya admin")
-            return
-        
-        if user_id in active_upload_drama:
-            del active_upload_drama[user_id]
-            await safe_edit_or_reply(
-                query,
-                "✅ *Drama Aktif Direset*\n\n"
-                "Kirim thumbnail baru untuk memulai upload drama.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Upload Drama", callback_data="upload")]]),
-                parse_mode='Markdown'
-            )
-        else:
-            await safe_edit_or_reply(
-                query,
-                "ℹ️ Tidak ada drama aktif.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Upload Drama", callback_data="upload")]]),
-                parse_mode='Markdown'
-            )
-        return
-
-    # ============================
-    # CREATE TOKEN (ADMIN)
-    # ============================
-    if query.data.startswith("create_token_"):
-        if not is_admin(user_id):
-            await safe_edit_or_reply(query, "❌ Hanya admin")
-            return
-        
-        sub_type = query.data.replace("create_token_", "")
-        
-        if sub_type not in SUBSCRIPTION_PRICES:
-            await safe_edit_or_reply(query, "❌ Tipe langganan tidak valid")
-            return
-        
-        # Generate token
-        token = generate_token()
-        subscription_tokens[token] = {
-            "type": sub_type,
-            "used": False,
-            "created_by": user_id,
-            "created_at": datetime.now()
         }
-        
-        sub_info = SUBSCRIPTION_PRICES[sub_type]
-        
-        token_text = (
-            "✅ *Token Berhasil Dibuat!*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎟️ *Token:* `{token}`\n"
-            f"📦 *Paket:* {sub_info['name']}\n"
-            f"💰 *Harga:* RM{sub_info['price']}\n"
-            f"📅 *Durasi:* {sub_info['days']} hari\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Kirim token ini ke user yang sudah bayar."
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("🎟️ Buat Token Lagi", callback_data="gen_token")],
-            [InlineKeyboardButton("« Admin Panel", callback_data="admin_panel")]
-        ]
-        
-        await safe_edit_or_reply(query, token_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
 
-    # ============================
-    # LIST TOKENS (ADMIN)
-    # ============================
-    if query.data == "list_tokens":
-        if not is_admin(user_id):
-            await safe_edit_or_reply(query, "❌ Hanya admin")
-            return
-        
-        unused_tokens = [(t, info) for t, info in subscription_tokens.items() if not info.get('used', False)]
-        
-        if not unused_tokens:
-            tokens_text = (
-                "🎟️ *Daftar Token*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "Tidak ada token yang tersedia.\n"
-                "Buat token baru di menu Generate Token."
-            )
-        else:
-            tokens_text = (
-                f"🎟️ *Daftar Token Tersedia* ({len(unused_tokens)})\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-            )
-            for token, info in unused_tokens[:10]:  # Max 10
-                sub_name = SUBSCRIPTION_PRICES.get(info['type'], {}).get('name', 'Unknown')
-                created = info.get('created_at', datetime.now()).strftime('%d/%m/%Y')
-                tokens_text += f"• `{token}`\n  📦 {sub_name} | 📅 {created}\n\n"
+        async function getVideoUrl(bookId, chapterIndex) {
+            // Try GET
+            try {
+                const res = await fetch(`${API}/watch/${bookId}/${chapterIndex}?lang=${LANG}&source=search_result`);
+                const data = await res.json();
+                if (data?.data?.videoUrl) return data.data.videoUrl;
+            } catch(e) {}
             
-            if len(unused_tokens) > 10:
-                tokens_text += f"_...dan {len(unused_tokens) - 10} token lainnya_"
-        
-        keyboard = [
-            [InlineKeyboardButton("🎟️ Generate Token", callback_data="gen_token")],
-            [InlineKeyboardButton("« Admin Panel", callback_data="admin_panel")]
-        ]
-        
-        await safe_edit_or_reply(query, tokens_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
-
-    # ============================
-    # LIST SUBSCRIBERS (ADMIN)
-    # ============================
-    if query.data == "list_subs":
-        if not is_admin(user_id):
-            await safe_edit_or_reply(query, "❌ Hanya admin")
-            return
-        
-        active_subs = [(uid, info) for uid, info in user_subscriptions.items() 
-                       if info.get('expires', datetime.min) > datetime.now()]
-        
-        # Get used tokens with user info
-        used_tokens_list = [(t, info) for t, info in subscription_tokens.items() if info.get('used', False)]
-        
-        if not active_subs:
-            subs_text = (
-                "👥 *Daftar Subscriber Aktif*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "Belum ada subscriber aktif.\n"
-            )
-        else:
-            subs_text = (
-                f"👥 *Daftar Subscriber Aktif* ({len(active_subs)})\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-            )
-            for uid, info in active_subs[:10]:  # Max 10
-                expires = info['expires']
-                remaining = (expires - datetime.now()).days
-                sub_type = SUBSCRIPTION_PRICES.get(info.get('type', ''), {}).get('name', 'Unknown')
-                exp_date = expires.strftime('%d/%m/%Y')
-                subs_text += f"• User `{uid}`\n  📦 {sub_type} | ⏳ {remaining} hari lagi\n  📅 Berakhir: {exp_date}\n\n"
+            // Try POST
+            try {
+                const res = await fetch(`${API}/watch/player?lang=${LANG}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ bookId: String(bookId), chapterIndex, lang: LANG })
+                });
+                const data = await res.json();
+                if (data?.data?.videoUrl) return data.data.videoUrl;
+            } catch(e) {}
             
-            if len(active_subs) > 10:
-                subs_text += f"_...dan {len(active_subs) - 10} subscriber lainnya_\n"
-        
-        # Add used tokens info with user
-        subs_text += "\n━━━━━━━━━━━━━━━━━━━━\n"
-        subs_text += "🎟️ *Riwayat Penggunaan Token:*\n\n"
-        
-        if not used_tokens_list:
-            subs_text += "Belum ada token yang digunakan.\n"
-        else:
-            for token, info in used_tokens_list[:10]:  # Max 10
-                used_by = info.get('used_by', 'Unknown')
-                used_at = info.get('used_at', datetime.now()).strftime('%d/%m/%Y %H:%M')
-                sub_name = SUBSCRIPTION_PRICES.get(info.get('type', ''), {}).get('name', 'Unknown')
-                subs_text += f"• `{token}`\n  👤 User: `{used_by}`\n  📦 {sub_name} | 📅 {used_at}\n\n"
+            return null;
+        }
+
+        // ========== HELPERS ==========
+        const getTitle = d => d?.bookName || d?.name || d?.title || 'Untitled';
+        const getCover = d => d?.cover || d?.coverWap || '';
+        const getId = d => d?.bookId || d?.id || '';
+        const getEpCount = d => d?.chapterCount || d?.seriesCount || 0;
+
+        function dramaCard(d, rank = null) {
+            return `
+            <div onclick="openDrama('${getId(d)}')" class="cursor-pointer group">
+                <div class="relative rounded-lg overflow-hidden bg-gray-800">
+                    ${rank !== null ? `<div class="absolute top-1 left-1 z-10 w-6 h-6 ${rank < 3 ? 'bg-yellow-500' : 'bg-gray-900/80'} rounded flex items-center justify-center text-xs font-bold">${rank + 1}</div>` : ''}
+                    <img src="${getCover(d)}" alt="${getTitle(d)}" class="w-full aspect-[2/3] object-cover group-hover:scale-105 transition-transform duration-300" onerror="this.src='https://placehold.co/200x300/374151/666?text=No+Image'">
+                    <div class="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                        <div class="w-12 h-12 rounded-full bg-purple-500 flex items-center justify-center">
+                            <svg class="w-6 h-6 ml-1" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                        </div>
+                    </div>
+                    <div class="absolute bottom-0 left-0 right-0 p-2 bg-gradient-to-t from-black to-transparent">
+                        <h3 class="text-sm font-medium line-clamp-2">${getTitle(d)}</h3>
+                        <p class="text-xs text-gray-400">${getEpCount(d)} Episode</p>
+                    </div>
+                </div>
+            </div>`;
+        }
+
+        function grid(items, withRank = false) {
+            if (!items?.length) return '<p class="text-gray-500 text-center py-10">Tidak ada data</p>';
+            return `<div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-3">${items.map((d, i) => dramaCard(d, withRank ? i : null)).join('')}</div>`;
+        }
+
+        function skeleton(n = 12) {
+            return `<div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 gap-3">${Array(n).fill('<div class="aspect-[2/3] bg-gray-800 rounded-lg animate-pulse"></div>').join('')}</div>`;
+        }
+
+        // ========== PAGES ==========
+        async function goHome() {
+            state.drama = null;
+            $('app').innerHTML = `
+                <div class="space-y-8">
+                    <section>
+                        <h2 class="text-lg font-bold mb-3 flex items-center gap-2">⭐ Rekomendasi</h2>
+                        <div id="secRecommend">${skeleton()}</div>
+                    </section>
+                    <section>
+                        <h2 class="text-lg font-bold mb-3 flex items-center gap-2">🔥 Populer</h2>
+                        <div id="secPopular">${skeleton(6)}</div>
+                    </section>
+                    <section>
+                        <h2 class="text-lg font-bold mb-3 flex items-center gap-2">🕐 Terbaru</h2>
+                        <div id="secNew">${skeleton()}</div>
+                    </section>
+                </div>`;
+
+            const [rec, pop, newD] = await Promise.all([
+                api(`/foryou/1?lang=${LANG}`),
+                api(`/rank/1?lang=${LANG}`),
+                api(`/new/1?lang=${LANG}&pageSize=12`)
+            ]);
+
+            $('secRecommend').innerHTML = grid(rec?.data?.list?.slice(0, 12) || []);
+            $('secPopular').innerHTML = grid(pop?.data?.list?.slice(0, 6) || [], true);
+            $('secNew').innerHTML = grid(newD?.data?.list?.slice(0, 12) || []);
+        }
+
+        // ========== SEARCH ==========
+        let searchTimer;
+        async function handleSearch(val) {
+            clearTimeout(searchTimer);
+            if (val.length < 2) { $('suggestions').classList.add('hidden'); return; }
+            searchTimer = setTimeout(async () => {
+                const res = await api(`/suggest/${encodeURIComponent(val)}?lang=${LANG}`);
+                const list = res?.data || [];
+                if (list.length) {
+                    $('suggestions').innerHTML = list.map(s => `<div onclick="pickSuggestion('${s}')" class="px-3 py-2 hover:bg-gray-700 cursor-pointer text-sm">${s}</div>`).join('');
+                    $('suggestions').classList.remove('hidden');
+                } else {
+                    $('suggestions').classList.add('hidden');
+                }
+            }, 300);
+        }
+
+        function pickSuggestion(val) {
+            $('searchInput').value = val;
+            $('suggestions').classList.add('hidden');
+            doSearch();
+        }
+
+        async function doSearch() {
+            const q = $('searchInput').value.trim();
+            if (!q) return;
+            $('suggestions').classList.add('hidden');
+            state.drama = null;
+            $('app').innerHTML = `<h2 class="text-lg font-bold mb-3">🔍 Hasil: "${q}"</h2><div id="results">${skeleton()}</div>`;
+            const res = await api(`/search/${encodeURIComponent(q)}/1?lang=${LANG}`);
+            $('results').innerHTML = grid(res?.data?.list || []);
+        }
+
+        // ========== DRAMA DETAIL ==========
+        async function openDrama(id) {
+            if (!id) return;
+            state.dramaId = id;
+            $('app').innerHTML = '<div class="flex justify-center py-20"><div class="w-10 h-10 border-4 border-purple-500 border-t-transparent rounded-full animate-spin"></div></div>';
+
+            const res = await api(`/chapters/${id}?lang=${LANG}`);
+            if (!res?.data) {
+                $('app').innerHTML = '<p class="text-center py-20 text-gray-500">Gagal memuat drama</p>';
+                return;
+            }
+
+            const drama = res.data;
+            state.drama = drama;
+            state.episodes = drama.chapterList || [];
+
+            const title = getTitle(drama);
+            const cover = getCover(drama);
+            const desc = drama.introduction || '';
+            const eps = state.episodes;
+
+            $('app').innerHTML = `
+                <button onclick="goHome()" class="text-purple-400 hover:underline mb-4 flex items-center gap-1">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+                    Kembali
+                </button>
+                
+                <div class="bg-gray-800 rounded-xl p-4 mb-4">
+                    <div class="flex gap-4">
+                        <img src="${cover}" alt="${title}" class="w-32 rounded-lg object-cover" onerror="this.src='https://placehold.co/200x300/374151/666?text=No+Image'">
+                        <div class="flex-1">
+                            <h1 class="text-xl font-bold mb-2">${title}</h1>
+                            <p class="text-sm text-gray-400 mb-3 line-clamp-2">${desc}</p>
+                            <p class="text-sm text-gray-400 mb-4">📺 ${eps.length} Episode</p>
+                            <div class="flex flex-wrap gap-2">
+                                ${eps.length > 0 ? `
+                                    <button onclick="playEp(0)" class="px-4 py-2 bg-purple-600 hover:bg-purple-700 rounded-lg font-medium flex items-center gap-2">
+                                        <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                                        Tonton
+                                    </button>
+                                    <button onclick="startDownload()" class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg font-medium flex items-center gap-2">
+                                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
+                                        Download ZIP (${eps.length} EP)
+                                    </button>
+                                ` : '<p class="text-gray-500">Tidak ada episode</p>'}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                ${eps.length > 0 ? `
+                    <div class="bg-gray-800 rounded-xl p-4">
+                        <h2 class="font-bold mb-3">Daftar Episode</h2>
+                        <div class="grid grid-cols-8 sm:grid-cols-10 md:grid-cols-12 gap-2">
+                            ${eps.map((ep, i) => `<button onclick="playEp(${i})" class="aspect-square rounded-lg bg-gray-700 hover:bg-purple-600 flex items-center justify-center text-sm font-medium transition">${i + 1}</button>`).join('')}
+                        </div>
+                    </div>
+                ` : ''}
+            `;
+        }
+
+        // ========== VIDEO PLAYER ==========
+        async function playEp(index) {
+            state.currentEp = index;
+            const ep = state.episodes[index];
+            const chapterIndex = ep?.chapterIndex ?? index;
+
+            $('videoModal').classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+            $('videoTitle').textContent = `${getTitle(state.drama)} - Episode ${index + 1}`;
+            $('videoPlayer').src = '';
+
+            $('epList').innerHTML = state.episodes.map((_, i) => 
+                `<button onclick="playEp(${i})" class="aspect-square rounded text-xs font-medium ${i === index ? 'bg-purple-600' : 'bg-gray-700 hover:bg-gray-600'}">${i + 1}</button>`
+            ).join('');
+
+            const url = await getVideoUrl(state.dramaId, chapterIndex);
+            if (url) {
+                const player = $('videoPlayer');
+                if (state.hls) { state.hls.destroy(); state.hls = null; }
+
+                if (url.includes('.m3u8') && Hls.isSupported()) {
+                    state.hls = new Hls();
+                    state.hls.loadSource(url);
+                    state.hls.attachMedia(player);
+                    state.hls.on(Hls.Events.MANIFEST_PARSED, () => player.play().catch(() => {}));
+                } else {
+                    player.src = url;
+                    player.onloadeddata = () => player.play().catch(() => {});
+                }
+                
+                player.onended = () => {
+                    if (state.currentEp + 1 < state.episodes.length) playEp(state.currentEp + 1);
+                };
+            }
+        }
+
+        function closeVideo() {
+            $('videoModal').classList.add('hidden');
+            document.body.style.overflow = '';
+            $('videoPlayer').pause();
+            $('videoPlayer').src = '';
+            if (state.hls) { state.hls.destroy(); state.hls = null; }
+        }
+
+        // ========== DOWNLOAD ZIP ==========
+        async function startDownload() {
+            if (state.downloading) return;
+            state.downloading = true;
+            state.cancelled = false;
+
+            const eps = state.episodes;
+            const title = getTitle(state.drama);
+            const safeTitle = title.replace(/[^a-zA-Z0-9\s]/g, '').replace(/\s+/g, '_');
+
+            // Show modal
+            $('downloadModal').classList.remove('hidden');
+            document.body.style.overflow = 'hidden';
+            $('dlCover').src = getCover(state.drama);
+            $('dlTitle').textContent = title;
+            $('dlEpCount').textContent = `${eps.length} Episode`;
+            $('btnClose').classList.add('hidden');
+            $('btnCancel').classList.remove('hidden');
+            $('dlLog').innerHTML = '';
+            $('dlBar').style.width = '0%';
+            $('dlProgress').textContent = '0%';
+
+            const log = (msg, type = 'info') => {
+                const colors = { info: 'text-gray-400', success: 'text-green-400', error: 'text-red-400', warning: 'text-yellow-400' };
+                $('dlLog').innerHTML += `<div class="${colors[type]}">${msg}</div>`;
+                $('dlLog').scrollTop = $('dlLog').scrollHeight;
+            };
+
+            const updateProgress = (current, total, status) => {
+                const pct = Math.round((current / total) * 100);
+                $('dlBar').style.width = pct + '%';
+                $('dlProgress').textContent = pct + '%';
+                $('dlStatus').textContent = status;
+            };
+
+            log('📡 Mengambil link video...');
             
-            if len(used_tokens_list) > 10:
-                subs_text += f"_...dan {len(used_tokens_list) - 10} token lainnya_\n"
-        
-        keyboard = [[InlineKeyboardButton("« Admin Panel", callback_data="admin_panel")]]
-        await safe_edit_or_reply(query, subs_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
+            const zip = new JSZip();
+            let success = 0;
+            let failed = 0;
 
-    # ============================
-    # LIST DRAMA
-    # ============================
-    if query.data.startswith("list"):
-        page = 0
-        if "_" in query.data:
-            page = int(query.data.split("_")[1])
-        
-        if not drama_database:
-            await safe_edit_or_reply(
-                query, 
-                "📭 *Belum Ada Drama*\n\n━━━━━━━━━━━━━━━━━━━━\nDatabase masih kosong.", 
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data="back")]]),
-                parse_mode='Markdown'
-            )
-            return
+            for (let i = 0; i < eps.length; i++) {
+                if (state.cancelled) {
+                    log('❌ Download dibatalkan', 'warning');
+                    break;
+                }
 
-        sorted_dramas = sorted(drama_database.items(), key=lambda x: x[1].get("title", ""))
-        page_items, total = paginate_items(sorted_dramas, page, items_per_page=8)
-        
-        keyboard = []
-        for did, info in page_items:
-            title = info.get("title", did)
-            ep_count = len(info.get("episodes", {}))
-            keyboard.append([InlineKeyboardButton(
-                f"🎬 {title} ({ep_count} EP)", 
-                callback_data=f"d_{did}"
-            )])
+                const ep = eps[i];
+                const chapterIndex = ep?.chapterIndex ?? i;
+                const filename = `${safeTitle}_EP${String(i + 1).padStart(2, '0')}.mp4`;
 
-        nav_buttons = []
-        if page > 0:
-            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list_{page-1}"))
-        if (page + 1) * 8 < total:
-            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"list_{page+1}"))
-        
-        if nav_buttons:
-            keyboard.append(nav_buttons)
-        
-        keyboard.append([InlineKeyboardButton("« Kembali", callback_data="back")])
-        kb = InlineKeyboardMarkup(keyboard)
+                updateProgress(i, eps.length * 2, `Mengambil link EP ${i + 1}/${eps.length}`);
+                $('dlDetail').textContent = `Episode ${i + 1} dari ${eps.length}`;
 
-        list_text = (
-            f"📺 *Daftar Drama* (Halaman {page + 1})\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Menampilkan {len(page_items)} dari {total} drama\n\n"
-            f"🔓 Episode 1-4: Gratis\n"
-            f"🔒 Episode 5+: Khusus VVIP\n\n"
-            f"Pilih drama untuk lihat episode:"
-        )
+                log(`📺 EP ${i + 1}: Mengambil link...`);
 
-        await safe_edit_or_reply(query, list_text, reply_markup=kb, parse_mode='Markdown')
-        return
+                const url = await getVideoUrl(state.dramaId, chapterIndex);
+                
+                if (!url) {
+                    log(`❌ EP ${i + 1}: Gagal mendapat link`, 'error');
+                    failed++;
+                    continue;
+                }
 
-    # ============================
-    # UPLOAD & STATS (ADMIN)
-    # ============================
-    if query.data == "upload":
-        if not is_admin(user_id):
-            await safe_edit_or_reply(query, "❌ Hanya admin")
-            return
-        
-        # Cek drama aktif
-        active_info = ""
-        if user_id in active_upload_drama:
-            active = active_upload_drama[user_id]
-            drama_id = active["drama_id"]
-            title = active["title"]
-            total_eps = len(drama_database.get(drama_id, {}).get("episodes", {}))
-            active_info = (
-                f"🎬 *Drama Aktif:* {title}\n"
-                f"📊 *Episode Tersimpan:* {total_eps}\n"
-                f"📺 *Episode Berikutnya:* {total_eps + 1}\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-            )
+                log(`⬇️ EP ${i + 1}: Downloading...`);
+                updateProgress(eps.length + i, eps.length * 2, `Download EP ${i + 1}/${eps.length}`);
 
-        text = (
-            "📤 *Panduan Upload Drama*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"{active_info}"
-            "*LANGKAH 1 - Kirim Thumbnail:*\n"
-            "Forward foto thumbnail dari channel dengan caption:\n"
-            "`#ID JudulDrama`\n\n"
-            "*LANGKAH 2 - Kirim Video Episode:*\n"
-            "Forward video dari channel *tanpa caption*\n"
-            "Episode akan otomatis dinomori (1, 2, 3, ...)\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "*Contoh:*\n"
-            "• Thumbnail: `#LBFD Love Between Fairy and Devil`\n"
-            "• Video: _(langsung forward tanpa caption)_\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "💡 *Tips:* Untuk ganti drama, kirim thumbnail baru"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔄 Reset Drama Aktif", callback_data="reset_active_drama")],
-            [InlineKeyboardButton("« Admin Panel", callback_data="admin_panel")]
-        ])
-        await safe_edit_or_reply(query, text, parse_mode="Markdown", reply_markup=kb)
-        return
+                try {
+                    const response = await fetch(url);
+                    if (!response.ok) throw new Error('Fetch failed');
 
-    if query.data == "stats":
-        if not is_admin(user_id):
-            await safe_edit_or_reply(query, "❌ Hanya admin")
-            return
+                    const contentLength = +response.headers.get('content-length') || 0;
+                    const reader = response.body.getReader();
+                    const chunks = [];
+                    let loaded = 0;
 
-        total_eps = sum(len(d.get('episodes', {})) for d in drama_database.values())
-        dramas_with_thumb = sum(1 for d in drama_database.values() if 'thumbnail' in d)
-        active_subs = len([u for u, s in user_subscriptions.items() if s.get('expires', datetime.min) > datetime.now()])
-        total_tokens_used = len([t for t, info in subscription_tokens.items() if info.get('used', False)])
-        
-        stats_text = (
-            "📋 *Statistik Database*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"📺 Total Drama: {len(drama_database)}\n"
-            f"🎥 Total Episode: {total_eps}\n"
-            f"🖼 Drama dengan Thumbnail: {dramas_with_thumb}\n"
-            f"📊 Rata-rata EP/Drama: {total_eps // len(drama_database) if drama_database else 0}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "*Statistik Langganan:*\n"
-            f"👑 Subscriber Aktif: {active_subs}\n"
-            f"🎟️ Token Sudah Digunakan: {total_tokens_used}\n"
-            f"🎟️ Token Tersedia: {len(subscription_tokens) - total_tokens_used}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "*Top 5 Drama (Episode Terbanyak):*\n"
-        )
-        
-        top_dramas = sorted(
-            drama_database.items(), 
-            key=lambda x: len(x[1].get('episodes', {})), 
-            reverse=True
-        )[:5]
-        
-        for i, (did, info) in enumerate(top_dramas, 1):
-            stats_text += f"{i}. {info.get('title', did)} - {len(info.get('episodes', {}))} EP\n"
-        
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("« Admin Panel", callback_data="admin_panel")]])
-        await safe_edit_or_reply(query, stats_text, parse_mode='Markdown', reply_markup=kb)
-        return
+                    while (true) {
+                        if (state.cancelled) break;
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        chunks.push(value);
+                        loaded += value.length;
+                        if (contentLength > 0) {
+                            $('dlDetail').textContent = `EP ${i + 1}: ${Math.round(loaded / 1024 / 1024)}MB / ${Math.round(contentLength / 1024 / 1024)}MB`;
+                        }
+                    }
 
-    # ============================
-    # PILIH DRAMA
-    # ============================
-    if query.data.startswith("d_"):
-        did = query.data[2:]
-        await show_episodes(query, did, user_id)
-        return
+                    if (state.cancelled) break;
 
-    # ============================
-    # EPISODE
-    # ============================
-    if query.data.startswith("ep_"):
-        parts = query.data.split("_")
-        if len(parts) == 3:
-            _, did, ep = parts
-            await send_episode(query, did, ep, context, user_id)
-        elif len(parts) == 4 and parts[1] == "page":
-            _, _, did, page = parts
-            await show_episodes(query, did, user_id, int(page))
-        return
+                    const blob = new Blob(chunks, { type: 'video/mp4' });
+                    zip.file(filename, blob);
+                    success++;
+                    log(`✅ EP ${i + 1}: OK (${Math.round(blob.size / 1024 / 1024)}MB)`, 'success');
+                } catch (e) {
+                    log(`❌ EP ${i + 1}: Download gagal`, 'error');
+                    failed++;
+                }
 
+                // Small delay to avoid overwhelming the server
+                await new Promise(r => setTimeout(r, 300));
+            }
 
-# =====================================
-# SHOW EPISODES
-# =====================================
-async def show_episodes(query, did, user_id, page=0):
-    if did not in drama_database:
-        await safe_edit_or_reply(
-            query, 
-            "❌ Drama tidak ditemukan.", 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Senarai Drama", callback_data="list")]])
-        )
-        return
+            if (state.cancelled) {
+                finishDownload();
+                return;
+            }
 
-    info = drama_database[did]
-    eps = info.get("episodes", {})
-    is_subscribed = is_user_subscribed(user_id)
-    
-    sorted_eps = sorted(eps.keys(), key=lambda x: int(x) if x.isdigit() else x)
-    page_eps, total = paginate_items(sorted_eps, page, items_per_page=20)
+            if (success === 0) {
+                log('❌ Tidak ada episode yang berhasil didownload', 'error');
+                finishDownload();
+                return;
+            }
 
-    keyboard = []
-    row = []
-    
-    for ep in page_eps:
-        ep_num = int(ep) if ep.isdigit() else 0
-        is_locked = ep_num >= LOCKED_EPISODE_START and not is_subscribed
-        
-        if is_locked:
-            btn_text = f"🔒 {ep}"
-        else:
-            btn_text = f"EP {ep}"
-        
-        row.append(InlineKeyboardButton(btn_text, callback_data=f"ep_{did}_{ep}"))
-        if len(row) == 5:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
+            // Create ZIP
+            log(`📦 Membuat file ZIP (${success} episode)...`);
+            updateProgress(95, 100, 'Membuat ZIP...');
 
-    nav_buttons = []
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"ep_page_{did}_{page-1}"))
-    nav_buttons.append(InlineKeyboardButton(f"📄 {page+1}/{(total-1)//20 + 1}", callback_data="noop"))
-    if (page + 1) * 20 < total:
-        nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"ep_page_{did}_{page+1}"))
-    
-    keyboard.append(nav_buttons)
-    keyboard.append([InlineKeyboardButton("« Daftar Drama", callback_data="list")])
-    kb = InlineKeyboardMarkup(keyboard)
+            try {
+                const zipBlob = await zip.generateAsync({ 
+                    type: 'blob',
+                    compression: 'DEFLATE',
+                    compressionOptions: { level: 1 }
+                }, (meta) => {
+                    $('dlDetail').textContent = `Kompres: ${Math.round(meta.percent)}%`;
+                });
 
-    vip_status = "👑 VVIP" if is_subscribed else "🔒 Free"
-    free_eps = min(LOCKED_EPISODE_START - 1, len(eps))
-    locked_eps = max(0, len(eps) - free_eps)
+                saveAs(zipBlob, `${safeTitle}_${success}EP.zip`);
+                updateProgress(100, 100, 'Selesai!');
+                log(`🎉 Download selesai! ${success} episode (${Math.round(zipBlob.size / 1024 / 1024)}MB)`, 'success');
+                if (failed > 0) log(`⚠️ ${failed} episode gagal`, 'warning');
+            } catch (e) {
+                log('❌ Gagal membuat ZIP', 'error');
+            }
 
-    text = (
-        f"🎬 *{info.get('title', did)}*\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📺 Total Episode: {len(eps)}\n"
-        f"🔓 Gratis: EP 1-{LOCKED_EPISODE_START-1}\n"
-        f"🔒 VVIP: EP {LOCKED_EPISODE_START}+\n"
-        f"👤 Status Kamu: {vip_status}\n"
-        f"📄 Halaman: {page + 1}/{(total-1)//20 + 1}\n\n"
-        f"Pilih episode untuk ditonton:"
-    )
-    
-    thumb = info.get("thumbnail")
+            finishDownload();
+        }
 
-    if thumb:
-        try:
-            await query.message.reply_photo(
-                photo=thumb, 
-                caption=text, 
-                reply_markup=kb, 
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            logger.error(f"reply_photo failed: {e}")
-            await safe_edit_or_reply(query, text, reply_markup=kb, parse_mode="Markdown")
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-    else:
-        await safe_edit_or_reply(query, text, reply_markup=kb, parse_mode="Markdown")
+        function finishDownload() {
+            state.downloading = false;
+            $('btnClose').classList.remove('hidden');
+            $('btnCancel').classList.add('hidden');
+        }
 
+        function cancelDownload() {
+            state.cancelled = true;
+            $('dlStatus').textContent = 'Membatalkan...';
+        }
 
-# =====================================
-# SEND EPISODE
-# =====================================
-async def send_episode(query, did, ep, context, user_id):
-    info = drama_database.get(did)
-    if not info or "episodes" not in info or ep not in info["episodes"]:
-        await safe_edit_or_reply(
-            query, 
-            "❌ Episode tidak ditemukan.", 
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Kembali", callback_data=f"d_{did}")]])
-        )
-        return
+        function closeDownloadModal() {
+            if (state.downloading && !state.cancelled) {
+                if (!confirm('Download sedang berjalan. Yakin batalkan?')) return;
+                state.cancelled = true;
+            }
+            $('downloadModal').classList.add('hidden');
+            document.body.style.overflow = '';
+            state.downloading = false;
+        }
 
-    # Check if episode is locked
-    ep_num = int(ep) if ep.isdigit() else 0
-    is_locked = ep_num >= LOCKED_EPISODE_START
-    is_subscribed = is_user_subscribed(user_id)
-    
-    # If locked and not subscribed, show subscription prompt
-    if is_locked and not is_subscribed:
-        lock_text = (
-            "🔒 *EPISODE TERKUNCI*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"🎬 *{info.get('title', did)}*\n"
-            f"📺 Episode {ep}\n\n"
-            f"Episode ini memerlukan langganan VVIP.\n"
-            f"Berlangganan sekarang untuk akses penuh!\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "💡 *Keuntungan VVIP:*\n"
-            "✅ Akses semua episode\n"
-            "✅ Tanpa batasan\n"
-            "✅ Tonton kapan saja"
-        )
-        
-        keyboard = [
-            [InlineKeyboardButton("👑 Berlangganan VVIP", callback_data="subscribe")],
-            [InlineKeyboardButton("🎟️ Redeem Token", callback_data="redeem")],
-            [InlineKeyboardButton("« Kembali", callback_data=f"d_{did}")]
-        ]
-        
-        await safe_edit_or_reply(query, lock_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
-        return
+        // ========== INIT ==========
+        document.addEventListener('click', e => {
+            if (!e.target.closest('#searchInput') && !e.target.closest('#suggestions')) {
+                $('suggestions').classList.add('hidden');
+            }
+        });
 
-    episode = info["episodes"][ep]
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Escape') {
+                closeVideo();
+                closeDownloadModal();
+            }
+        });
 
-    # DELETE PREVIOUS VIDEO AND NAVIGATION if exists
-    if user_id in user_video_messages:
-        prev_msgs = user_video_messages[user_id]
-        
-        # Delete previous video
-        if prev_msgs.get("video"):
-            try:
-                await context.bot.delete_message(chat_id=query.message.chat_id, message_id=prev_msgs["video"])
-                logger.info(f"Deleted previous video for user {user_id}")
-            except Exception as e:
-                logger.debug(f"Could not delete previous video: {e}")
-        
-        # Delete previous navigation
-        if prev_msgs.get("nav"):
-            try:
-                await context.bot.delete_message(chat_id=query.message.chat_id, message_id=prev_msgs["nav"])
-                logger.info(f"Deleted previous navigation for user {user_id}")
-            except Exception as e:
-                logger.debug(f"Could not delete previous navigation: {e}")
-
-    caption = (
-        f"🎬 *{info.get('title',did)}*\n"
-        f"📺 Episode {ep}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"Selamat menonton! 🍿\n\n"
-        f"⚠️ Video ini dilindungi dan tidak bisa didownload atau dibagikan."
-    )
-
-    try:
-        # Send video with protect_content=True to prevent download/forward
-        sent_video = await query.message.reply_video(
-            episode["file_id"], 
-            caption=caption, 
-            parse_mode="Markdown",
-            protect_content=True  # Mencegah download/forward
-        )
-        
-    except Exception as e:
-        logger.error(f"reply_video failed: {e}")
-        await safe_edit_or_reply(query, "❌ Gagal mengirim video.")
-        return
-
-    # Navigation buttons
-    next_ep = str(int(ep) + 1) if ep.isdigit() else None
-    prev_ep = str(int(ep) - 1) if ep.isdigit() and int(ep) > 1 else None
-    keyboard = []
-    
-    nav_row = []
-    if prev_ep and prev_ep in info["episodes"]:
-        nav_row.append(InlineKeyboardButton(f"◀️ EP {prev_ep}", callback_data=f"ep_{did}_{prev_ep}"))
-    
-    if next_ep and next_ep in info["episodes"]:
-        next_locked = int(next_ep) >= LOCKED_EPISODE_START and not is_subscribed
-        if next_locked:
-            nav_row.append(InlineKeyboardButton(f"🔒 EP {next_ep}", callback_data=f"ep_{did}_{next_ep}"))
-        else:
-            nav_row.append(InlineKeyboardButton(f"EP {next_ep} ▶️", callback_data=f"ep_{did}_{next_ep}"))
-    
-    if nav_row:
-        keyboard.append(nav_row)
-    
-    keyboard.append([InlineKeyboardButton("📺 Daftar Episode", callback_data=f"d_{did}")])
-    keyboard.append([InlineKeyboardButton("🏠 Menu Utama", callback_data="back")])
-    kb = InlineKeyboardMarkup(keyboard)
-
-    sent_nav = None
-    try:
-        sent_nav = await query.message.reply_text(
-            "━━━━━━━━━━━━━━━━━━━━\n*Navigasi:*\n\n⚠️ _Video sebelumnya akan dihapus saat menonton episode lain_", 
-            reply_markup=kb, 
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.error(f"reply_text navigation failed: {e}")
-    
-    # Store both video and navigation message IDs for later deletion
-    user_video_messages[user_id] = {
-        "video": sent_video.message_id,
-        "nav": sent_nav.message_id if sent_nav else None
-    }
-
-
-# =====================================
-# USER MESSAGE HANDLER
-# =====================================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    
-    if not msg:
-        return
-
-    user_id = msg.from_user.id
-
-    # FORWARD → INDEX
-    if msg.forward_origin:
-        await index_message(update, context)
-        return
-
-    # REDEEM TOKEN MODE
-    if context.user_data.get("waiting") == "redeem_token":
-        token = (msg.text or "").strip().upper()
-        
-        if not token:
-            await msg.reply_text("❌ Masukkan token yang sah.")
-            return
-        
-        if token not in subscription_tokens:
-            await msg.reply_text(
-                "❌ *Token Tidak Valid*\n\n"
-                "Token yang kamu masukkan tidak ditemukan.\n"
-                "Pastikan token benar atau hubungi admin.",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("👑 Berlangganan", callback_data="subscribe")],
-                    [InlineKeyboardButton("« Menu Utama", callback_data="back")]
-                ])
-            )
-            context.user_data["waiting"] = None
-            return
-        
-        token_info = subscription_tokens[token]
-        
-        if token_info.get('used', False):
-            await msg.reply_text(
-                "❌ *Token Sudah Digunakan*\n\n"
-                "Token ini sudah pernah digunakan.\n"
-                "Hubungi admin untuk token baru.",
-                parse_mode='Markdown',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("👑 Berlangganan", callback_data="subscribe")],
-                    [InlineKeyboardButton("« Menu Utama", callback_data="back")]
-                ])
-            )
-            context.user_data["waiting"] = None
-            return
-        
-        # Activate subscription
-        sub_type = token_info['type']
-        activate_subscription(user_id, sub_type)
-        
-        # Mark token as used
-        subscription_tokens[token]['used'] = True
-        subscription_tokens[token]['used_by'] = user_id
-        subscription_tokens[token]['used_at'] = datetime.now()
-        
-        sub_info = SUBSCRIPTION_PRICES[sub_type]
-        expires = user_subscriptions[user_id]['expires']
-        
-        await msg.reply_text(
-            "✅ *LANGGANAN BERHASIL DIAKTIFKAN!*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👑 Selamat! Kamu sekarang VVIP Member!\n\n"
-            f"📦 *Paket:* {sub_info['name']}\n"
-            f"📅 *Berlaku sampai:* {expires.strftime('%d %B %Y, %H:%M')}\n\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Nikmati akses penuh ke semua episode! 🎬",
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📺 Tonton Drama", callback_data="list")],
-                [InlineKeyboardButton("🏠 Menu Utama", callback_data="back")]
-            ])
-        )
-        
-        context.user_data["waiting"] = None
-        logger.info(f"User {user_id} redeemed token {token} for {sub_type}")
-        return
-
-    # SEARCH MODE
-    if context.user_data.get("waiting") == "search":
-        text = (msg.text or "").strip()
-        if not text:
-            await msg.reply_text("❌ Masukkan nama drama.")
-            return
-
-        query_lower = text.lower()
-        results = [
-            (did, info["title"])
-            for did, info in drama_database.items()
-            if query_lower in info.get("title", "").lower()
-        ]
-
-        if not results:
-            search_text = (
-                "❌ *Tidak Ditemukan*\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Drama dengan kata kunci *\"{text}\"* tidak ditemukan.\n\n"
-                f"Coba kata kunci lain atau lihat daftar lengkap."
-            )
-            await msg.reply_text(
-                search_text,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📺 Lihat Semua Drama", callback_data="list")],
-                    [InlineKeyboardButton("« Kembali", callback_data="back")]
-                ]),
-                parse_mode='Markdown'
-            )
-        else:
-            keyboard = []
-            for did, title in results:
-                ep_count = len(drama_database[did].get("episodes", {}))
-                keyboard.append([InlineKeyboardButton(
-                    f"🎬 {title} ({ep_count} EP)", 
-                    callback_data=f"d_{did}"
-                )])
-            keyboard.append([InlineKeyboardButton("« Kembali", callback_data="back")])
-            
-            result_text = (
-                f"🔍 *Hasil Pencarian*\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"Ditemukan {len(results)} drama dengan kata kunci *\"{text}\"*:\n\n"
-                f"Pilih drama:"
-            )
-            
-            await msg.reply_text(
-                result_text, 
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode='Markdown'
-            )
-
-        context.user_data["waiting"] = None
-        return
-
-
-# =====================================
-# SET BOT COMMANDS
-# =====================================
-async def post_init(application: Application):
-    commands = [
-        BotCommand("start", "Mulai bot dan paparkan menu utama")
-    ]
-    await application.bot.set_my_commands(commands)
-    logger.info("Bot commands set successfully")
-
-
-# =====================================
-# MAIN
-# =====================================
-def main():
-    Thread(target=run_flask, daemon=True).start()
-
-    app_bot = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    app_bot.add_handler(CommandHandler("start", start))
-    app_bot.add_handler(CallbackQueryHandler(button_handler))
-    app_bot.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
-
-    logger.info("Bot berjalan dengan fitur VVIP Subscription...")
-    app_bot.run_polling()
-
-if __name__ == "__main__":
-    main()
+        goHome();
+    </script>
+</body>
+</html>
